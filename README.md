@@ -1,4 +1,4 @@
-![](figures/framework.png)
+![](framework.png)
 
 > [**Differentiable Multi-Granularity Human Representation Learning for Instance-Aware Human Semantic Parsing**](https://arxiv.org/abs/2103.04570),            
 > [Tianfei Zhou](https://www.tfzhou.com/), [Wenguan Wang](https://sites.google.com/view/wenguanwang/), Si Liu, Yi Yang and [Luc Van Gool](https://scholar.google.com/citations?user=TwMib_QAAAAJ&hl=en) <br>
