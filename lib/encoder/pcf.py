@@ -1,0 +1,97 @@
+## Part Center Field
+
+import torch
+import torch.nn as nn
+
+import dataclasses
+import numpy as np
+import cv2
+
+from ..show.flow_vis import flow_compute_color
+
+
+@dataclasses.dataclass
+class Pcf:
+    sigma: float = 4
+
+    def __call__(self, image, anns, meta):
+        return PcfGenerator(self)(image, anns, meta)
+
+
+class PcfGenerator(nn.Module):
+    def __init__(self, config: Pcf):
+        super(PcfGenerator, self).__init__()
+
+        self.sigma = config.sigma
+        size = 6 * self.sigma + 3
+        x = np.arange(0, size, 1, float)
+        y = x[:, np.newaxis]
+        x0, y0 = 3 * self.sigma + 1, 3 * self.sigma + 1
+        self.g = np.exp(- ((x - x0) ** 2 + (y - y0) ** 2) / (2 * self.sigma ** 2))
+
+    def __call__(self, image, anns, meta):
+        height, width = image.shape[1:3]
+        center = np.zeros((1, height, width), dtype=np.float32)
+        offset = np.zeros((2, height, width), dtype=np.float32)
+        weight = np.ones((height, width), dtype=np.float32)
+
+        y_coord = np.ones((height, width), dtype=np.float32)
+        x_coord = np.ones((height, width), dtype=np.float32)
+        y_coord = np.cumsum(y_coord, axis=0) - 1
+        x_coord = np.cumsum(x_coord, axis=1) - 1
+
+        for ann in anns:
+            if 'parsing' in ann:
+                mask = np.copy(ann['parsing'])
+
+                weight[mask > 0] = 1
+                weight[mask == 255] = 0
+
+                part_ids = np.unique(mask)
+                for part_id in part_ids:
+                    if part_id == 0 or part_id == 255:
+                        continue
+                    mask_index = np.where(mask == part_id)
+                    center_y, center_x =\
+                        np.mean(mask_index[0]), np.mean(mask_index[1])
+
+                    # generate center heatmap
+                    y, x = int(center_y), int(center_x)
+                    # outside image boundary
+                    if x < 0 or y < 0 or \
+                            x >= width or y >= height:
+                        continue
+                    sigma = self.sigma
+                    # upper left
+                    ul = int(np.round(x - 3 * sigma - 1)), int(
+                        np.round(y - 3 * sigma - 1))
+                    # bottom right
+                    br = int(np.round(x + 3 * sigma + 2)), int(
+                        np.round(y + 3 * sigma + 2))
+
+                    c, d = max(0, -ul[0]), min(br[0], width) - ul[0]
+                    a, b = max(0, -ul[1]), min(br[1], height) - ul[1]
+
+                    cc, dd = max(0, ul[0]), min(br[0], width)
+                    aa, bb = max(0, ul[1]), min(br[1], height)
+                    center[0, aa:bb, cc:dd] = np.maximum(
+                        center[0, aa:bb, cc:dd], self.g[a:b, c:d])
+
+                    # generate offset (2, h, w) -> (y-dir, x-dir)
+                    offset_y_index = (np.zeros_like(mask_index[0]), mask_index[0], mask_index[1])
+                    offset_x_index = (np.ones_like(mask_index[0]), mask_index[0], mask_index[1])
+                    offset[offset_y_index] = center_y - y_coord[mask_index]
+                    offset[offset_x_index] = center_x - x_coord[mask_index]
+
+
+        #image = image.cpu().numpy()
+        #image = image.transpose((1, 2, 0))
+
+        #center = center[0, ...]
+        #cv2.imwrite('1111.jpg', center*255)
+
+        #image = flow_compute_color(offset[1, ...], offset[0, ...])
+        #cv2.imwrite('1111.jpg', image)
+
+        return {'center': (torch.from_numpy(center), torch.from_numpy(offset),
+                           torch.from_numpy(weight))}

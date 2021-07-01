@@ -1,0 +1,123 @@
+import numpy as np
+import dataclasses
+import torch
+import scipy.spatial
+import skfmm
+from .annrescaler import AnnRescaler
+
+COCO_IGNORE_INDEX = [2, 3, 4, 5]
+COCO_IGNORE_INDEX = []
+
+
+@dataclasses.dataclass
+class Offset:
+    rescaler: AnnRescaler
+
+    n_fields: int = 2
+    stride: int = 4
+
+    def __call__(self, image, anns, meta):
+        return OffsetGenerator(self)(image, anns, meta)
+
+
+def nearest_neightbor_search(query_points, key_points):
+    mytree = scipy.spatial.cKDTree(key_points)
+    _, indexes = mytree.query(query_points)
+    return indexes
+
+
+def nearest_neighbor_search_geodesic_distance(mask, query_points, key_points):
+    n_kp = key_points.shape[0]
+
+    for ii in range(n_kp):
+        mask[int(key_points[ii][0]), int(key_points[ii][1])] = 1
+
+    all_dt = np.zeros((mask.shape[0], mask.shape[1], n_kp))
+    for ii in range(n_kp):
+        y, x = int(key_points[ii][0]), int(key_points[ii][1])
+        r_mask = ~mask.astype(np.bool)
+
+        m = np.ones_like(mask).astype(float)
+        m[y, x] = 0
+        m = np.ma.masked_array(m, r_mask)
+        dt = skfmm.distance(m)
+
+        all_dt[:, :, ii] = dt
+
+    indexes = np.argmin(all_dt, axis=2)
+    indexes = indexes[query_points[:, 0], query_points[:, 1]]
+    return indexes
+
+
+class OffsetGenerator(object):
+    def __init__(self, config: Offset):
+        self.config = config
+        self.n_fields = config.n_fields
+        self.stride = config.stride
+
+    def __call__(self, image, anns, meta):
+        return self._generator(image, anns, meta)
+
+    def _generator(self, image, anns, meta):
+        h, w = image.shape[1:3]
+        h, w = h // self.stride + 1, w // self.stride + 1
+
+        offset = np.zeros((5, h, w), dtype=np.float32)
+        weights = np.zeros((1, h, w), dtype=np.float32)
+        instance = np.zeros((1, h, w), dtype=np.float32)
+
+        keypoints = self.config.rescaler.keypoint_sets(anns)
+        segmentations = self.config.rescaler.segmentation(anns)
+
+        num = len(segmentations)
+        for iid in range(num):
+            keypoint = keypoints[iid, ...]
+            segmentation = segmentations[iid]
+            if segmentation is None:
+                continue
+
+            segmentation[segmentation == 255] = 0
+            mask_index = np.where(segmentation > 0)
+            y_index, x_index = mask_index[0], mask_index[1]
+
+            if len(y_index) == 0 or len(x_index) == 0:
+                continue
+
+            weights[0, y_index, x_index] = 1
+            instance[0, y_index, x_index] = iid
+
+            query_points = np.dstack([y_index.ravel(), x_index.ravel()])[0]
+
+            key_points = []
+            for ii, x in enumerate(keypoint):
+                if x[0] > 0 and x[1] > 0 and x[2] > 0:
+                    if ii+1 not in COCO_IGNORE_INDEX:
+                        key_points.append([x[1], x[0]])
+            if len(key_points) == 0:
+                continue
+            key_points = np.array(key_points)
+            #key_points = np.array(
+            #    [[x[1], x[0]] for x in keypoints if x[-1] > 0 and x[0] > 0 and x[1] > 0])
+
+            indexes = nearest_neightbor_search(query_points, key_points)
+
+            for ii in range(len(key_points)):
+                points = query_points[indexes == ii]
+                yy, xx = key_points[ii][0], key_points[ii][1]
+                x_offset = xx - points[:, 1]
+                y_offset = yy - points[:, 0]
+
+                # offset
+                offset[0, points[:, 0], points[:, 1]] = y_offset
+                offset[1, points[:, 0], points[:, 1]] = x_offset
+
+                # target
+                offset[2, points[:, 0], points[:, 1]] = yy
+                offset[3, points[:, 0], points[:, 1]] = xx
+
+                # label
+                offset[4, points[:, 0], points[:, 1]] = ii+1
+
+        return {'offset': (torch.from_numpy(offset),
+                           torch.from_numpy(weights),
+                           torch.from_numpy(instance))}

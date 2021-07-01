@@ -1,0 +1,548 @@
+import logging
+import torch
+import torch.nn as nn
+
+import collections
+import numpy as np
+
+from . import heads
+from .. import datasets
+from ..decoder import Generator
+from ..decoder import FieldConfig
+from ..decoder import CifHr, CifSeeds, CafScored
+from ..functional import scalar_square_add_gauss_with_max
+
+LOG = logging.getLogger(__name__)
+
+
+class ShellXception(torch.nn.Module):
+    def __init__(self, base_net,
+                 pose_decoder, pose_heads, *,
+                 semantic_decoder=None, semantic_head=None,
+                 offset_decoder=None, offset_head=None,
+                 center_decoder=None, center_head=None,
+                 process_heads=None, cross_talk=0.0,
+                 with_edge=False, with_dsn=False):
+        super(ShellXception, self).__init__()
+
+        self.head_nets = pose_heads
+        if semantic_head is not None:
+            self.head_nets = self.head_nets + [semantic_head]
+        if offset_head is not None:
+            self.head_nets = self.head_nets + [offset_head]
+        if center_head is not None:
+            self.head_nets = self.head_nets + [center_head]
+
+        self.base_net = base_net
+        self.pose_decoder = pose_decoder
+        self.pose_heads = nn.ModuleList(pose_heads)
+        self.center_head = center_head
+        self.center_decoder = center_decoder
+        self.semantic_decoder = semantic_decoder
+        self.offset_decoder = offset_decoder
+        self.semantic_head = semantic_head
+        self.offset_head = offset_head
+
+        self.cross_talk = cross_talk
+        self.with_edge = with_edge
+        self.with_dsn = with_dsn
+        self.process_heads = process_heads
+
+        self.config = FieldConfig()
+        self.accumulated = None
+        self.v_threshold = 0.1
+
+    def forward(self, *args):
+        head_outputs = {}
+
+        image_batch = args[0]
+
+        if self.training and self.cross_talk:
+            rolled_images = torch.cat((image_batch[-1:], image_batch[:-1]))
+            image_batch += rolled_images * self.cross_talk
+
+        x = self.base_net(image_batch)
+
+        assert self.pose_decoder is not None
+        # run pose branch
+        x_pose = self.pose_decoder(x)
+        out_pose = [hn(x_pose) for hn in self.pose_heads]
+        if self.process_heads is not None:
+            out_pose = self.process_heads(out_pose)
+        head_outputs['pose'] = out_pose
+
+        head_outputs['semantic'] = []
+        x_semantic = self.semantic_decoder(x)
+        out_semantic = self.semantic_head(x_semantic)
+        if 'semantic' in out_semantic:
+            head_outputs['semantic'].append(out_semantic['semantic'])
+        if 'edge' in out_semantic:
+            head_outputs['semantic'].append(out_semantic['edge'])
+
+        x_offset = self.offset_decoder(x)
+        head_outputs['offset'] = [self.offset_head(x_offset)['offset']]
+
+        # run segmentation branch
+        #if self.cascade_head is not None:
+        #    out_segm = self.cascade_head(x)
+
+        #    head_outputs['semantic'] = []
+        #    head_outputs['offset'] = []
+
+        #    out_segm = collections.OrderedDict(sorted(out_segm.items()))
+        #    for key, value in out_segm.items():
+        #        if 'semantic' in key:
+        #            head_outputs['semantic'].append(value)
+        #        if 'offset' in key:
+        #            head_outputs['offset'].append(value)
+
+        # run center branch
+        if self.center_decoder is not None and self.center_head is not None:
+            x_center = self.center_decoder(x)
+            out_center = self.center_head(x_center)
+            head_outputs['center'] = out_center
+
+        return head_outputs
+
+    def get_seeds(self, fields):
+        for cif_i, stride, min_scale in zip(self.config.cif_indices,
+                                            self.config.cif_strides,
+                                            self.config.cif_min_scales):
+            self.fill_cif(fields[cif_i], stride, min_scale=min_scale)
+
+    def fill_cif(self, cif, stride, min_scale=0.0):
+        return self.fill_multiple([cif], stride, min_scale)
+
+    def fill_multiple(self, cifs, stride, min_scale=0.0):
+        if self.accumulated is None:
+            shape = (
+                cifs[0].shape[0],
+                int((cifs[0].shape[2] - 1) * stride + 1),
+                int((cifs[0].shape[3] - 1) * stride + 1),
+            )
+            ta = np.zeros(shape, dtype=np.float32)
+        else:
+            ta = np.zeros(self.accumulated.shape, dtype=np.float32)
+
+        for cif in cifs:
+            for t, p in zip(ta, cif):
+                self.accumulate(len(cifs), t, p, stride, min_scale)
+
+        if self.accumulated is None:
+            self.accumulated = ta
+        else:
+            self.accumulated = np.maximum(ta, self.accumulated)
+        return self
+
+    def accumulate(self, len_cifs, t, p, stride, min_scale):
+        x_confidence, x_regs, x_logbs, x_scales = p
+
+        p = p[:, p[0] > self.v_threshold]
+        if min_scale:
+            p = p[:, p[4] > min_scale / stride]
+
+        v, x, y, _, scale = p
+        x = x * stride
+        y = y * stride
+        sigma = np.maximum(1.0, 0.5 * scale * stride)
+
+        # Occupancy covers 2sigma.
+        # Restrict this accumulation to 1sigma so that seeds for the same joint
+        # are properly suppressed.
+        scalar_square_add_gauss_with_max(
+            t, x, y, sigma, v / self.neighbors / len_cifs, truncate=1.0)
+
+
+class ShellHRNet(torch.nn.Module):
+    def __init__(self, base_net,
+                 pose_decoder, pose_heads, *,
+                 cascade_head=None,
+                 center_decoder=None, center_head=None,
+                 process_heads=None, cross_talk=0.0,
+                 with_edge=False, with_dsn=False):
+        super(ShellHRNet, self).__init__()
+
+        self.head_nets = pose_heads
+        if cascade_head is not None:
+            self.head_nets = self.head_nets + [cascade_head]
+        if center_head is not None:
+            self.head_nets = self.head_nets + [center_head]
+
+        self.base_net = base_net
+        self.pose_decoder = pose_decoder
+        self.pose_heads = nn.ModuleList(pose_heads)
+        self.cascade_head = cascade_head
+        self.center_head = center_head
+        self.center_decoder = center_decoder
+
+        self.cross_talk = cross_talk
+        self.with_edge = with_edge
+        self.with_dsn = with_dsn
+        self.process_heads = process_heads
+
+        self.config = FieldConfig()
+        self.accumulated = None
+        self.v_threshold = 0.1
+
+    def forward(self, *args):
+        head_outputs = {}
+
+        image_batch = args[0]
+
+        if self.training and self.cross_talk:
+            rolled_images = torch.cat((image_batch[-1:], image_batch[:-1]))
+            image_batch += rolled_images * self.cross_talk
+
+        x = self.base_net(image_batch)
+
+        assert self.pose_decoder is not None
+        # run pose branch
+        x_pose = self.pose_decoder(x)
+        out_pose = [hn(x_pose) for hn in self.pose_heads]
+        if self.process_heads is not None:
+            out_pose = self.process_heads(out_pose)
+        head_outputs['pose'] = out_pose
+
+        # run segmentation branch
+        if self.cascade_head is not None:
+            out_segm = self.cascade_head(x)
+
+            head_outputs['semantic'] = []
+            head_outputs['offset'] = []
+
+            out_segm = collections.OrderedDict(sorted(out_segm.items()))
+            for key, value in out_segm.items():
+                if 'semantic' in key:
+                    head_outputs['semantic'].append(value)
+                if 'offset' in key:
+                    head_outputs['offset'].append(value)
+
+        # run center branch
+        if self.center_decoder is not None and self.center_head is not None:
+            x_center = self.center_decoder(x)
+            out_center = self.center_head(x_center)
+            head_outputs['center'] = out_center
+
+        return head_outputs
+
+    def get_seeds(self, fields):
+        for cif_i, stride, min_scale in zip(self.config.cif_indices,
+                                            self.config.cif_strides,
+                                            self.config.cif_min_scales):
+            self.fill_cif(fields[cif_i], stride, min_scale=min_scale)
+
+    def fill_cif(self, cif, stride, min_scale=0.0):
+        return self.fill_multiple([cif], stride, min_scale)
+
+    def fill_multiple(self, cifs, stride, min_scale=0.0):
+        if self.accumulated is None:
+            shape = (
+                cifs[0].shape[0],
+                int((cifs[0].shape[2] - 1) * stride + 1),
+                int((cifs[0].shape[3] - 1) * stride + 1),
+            )
+            ta = np.zeros(shape, dtype=np.float32)
+        else:
+            ta = np.zeros(self.accumulated.shape, dtype=np.float32)
+
+        for cif in cifs:
+            for t, p in zip(ta, cif):
+                self.accumulate(len(cifs), t, p, stride, min_scale)
+
+        if self.accumulated is None:
+            self.accumulated = ta
+        else:
+            self.accumulated = np.maximum(ta, self.accumulated)
+        return self
+
+    def accumulate(self, len_cifs, t, p, stride, min_scale):
+        x_confidence, x_regs, x_logbs, x_scales = p
+
+        p = p[:, p[0] > self.v_threshold]
+        if min_scale:
+            p = p[:, p[4] > min_scale / stride]
+
+        v, x, y, _, scale = p
+        x = x * stride
+        y = y * stride
+        sigma = np.maximum(1.0, 0.5 * scale * stride)
+
+        # Occupancy covers 2sigma.
+        # Restrict this accumulation to 1sigma so that seeds for the same joint
+        # are properly suppressed.
+        scalar_square_add_gauss_with_max(
+            t, x, y, sigma, v / self.neighbors / len_cifs, truncate=1.0)
+
+
+
+class Shell(torch.nn.Module):
+    def __init__(self, base_net,
+                 pose_decoder, pose_heads, *,
+                 segm_decoder=None, segm_heads=None,
+                 offset_decoder=None, offset_heads=None,
+                 process_heads=None, cross_talk=0.0,
+                 with_edge=False, with_dsn=False):
+        super(Shell, self).__init__()
+
+        self.head_nets = pose_heads
+        if segm_heads is not None:
+            self.head_nets = self.head_nets + segm_heads
+        if offset_heads is not None:
+            self.head_nets = self.head_nets + [offset_heads]
+
+        self.base_net = base_net
+        self.pose_decoder = pose_decoder
+        self.pose_heads = nn.ModuleList(pose_heads)
+        self.segm_decoder = segm_decoder
+        self.segm_heads = nn.ModuleList(segm_heads)
+
+        self.offset_decoder = offset_decoder
+        self.offset_heads = offset_heads
+        self.process_heads = process_heads
+        self.cross_talk = cross_talk
+        self.with_edge = with_edge
+        self.with_dsn = with_dsn
+
+    def forward(self, *args):
+        head_outputs = {}
+
+        image_batch = args[0]
+
+        if self.training and self.cross_talk:
+            rolled_images = torch.cat((image_batch[-1:], image_batch[:-1]))
+            image_batch += rolled_images * self.cross_talk
+
+        x = self.base_net(image_batch)
+
+        assert self.pose_decoder is not None
+        assert self.segm_decoder is not None
+
+        # run segmentation branch
+        x_segm = self.segm_decoder(x)
+        out_segm = [hn(x_segm) for hn in self.segm_heads]
+
+        head_outputs['semantic'] = []
+        if len(out_segm) > 0:
+            head_outputs['semantic'].append(out_segm[0]['semantic'])
+            if self.with_edge:
+                head_outputs['semantic'].append(out_segm[0]['edge'])
+        if len(out_segm) > 1:
+            head_outputs['offset'] = out_segm[1]['offset']
+
+        votemap = self.voting(out_segm[0]['semantic'], out_segm[1]['offset'])
+        head_outputs['vote'] = votemap
+
+        # run pose branch
+        x_pose = self.pose_decoder(x)
+
+        x_pose_attend = x_pose * votemap + x_pose
+        fusion_feat = [x_pose_attend, votemap] + [head_outputs['semantic'][0][:, 1:, ...]]
+        if self.with_edge:
+            fusion_feat += [head_outputs['semantic'][1]]
+
+        x_pose = torch.cat(fusion_feat, dim=1)
+        out_pose = [hn(x_pose) for hn in self.pose_heads]
+        if self.process_heads is not None:
+            out_pose = self.process_heads(out_pose)
+        head_outputs['pose'] = out_pose
+
+
+        ## run pose
+        #if self.pose_decoder is not None:
+        #    x_pose = self.pose_decoder(x)
+        #    out_pose = [hn(x_pose) for hn in self.pose_heads]
+        #else:
+        #    out_pose = [hn(x) for hn in self.pose_head_nets]
+        #if self.process_heads is not None:
+        #    out_pose = self.process_heads(out_pose)
+
+        #head_outputs['pose'] = out_pose
+
+        ## run segm
+        #if self.segm_decoder is not None:
+        #    x_segm = self.segm_decoder(x)
+        #    out = self.segm_heads(x_segm)
+
+        #    if self.with_edge:
+        #        head_outputs['semantic'] = [out['semantic'], out['edge']]
+        #    else:
+        #        head_outputs['semantic'] = [out['semantic']]
+
+        #if self.offset_heads is not None:
+        #    x_offset = self.offset_decoder(x)
+
+        #    x_offset_feat = torch.cat((x_segm, x_offset, x_pose), dim=1)
+        #    out_offset = self.offset_heads(x_offset_feat)['offset']
+        #    head_outputs['offset'] = out_offset
+
+        return head_outputs
+
+    def voting(self, semantic, offset):
+        bs = semantic.shape[0]
+        hh, ww = semantic.shape[2], semantic.shape[3]
+
+        vote_map = torch.zeros_like(offset[:, :1, ...])
+
+        device = semantic.get_device()
+        xx, yy = torch.Tensor(list(range(ww))), torch.Tensor(list(range(hh)))
+        xx, yy = xx.to(device), yy.to(device)
+        grid_y, grid_x = torch.meshgrid(yy, xx)
+
+        for ii in range(bs):
+            segm_pred = torch.argmax(semantic[ii, ...], axis=0)
+            segm_pred[segm_pred > 0] = 1
+            segm_pred = segm_pred.bool()
+
+            coord_x = torch.masked_select(grid_x, segm_pred).long()
+            coord_y = torch.masked_select(grid_y, segm_pred).long()
+
+            offset_x = offset[ii, 1, coord_y, coord_x]
+            offset_y = offset[ii, 0, coord_y, coord_x]
+
+            vote_x = coord_x + offset_x
+            vote_y = coord_y + offset_y
+            vote_x = torch.clamp(vote_x, 0, ww-1).long()
+            vote_y = torch.clamp(vote_y, 0, hh-1).long()
+
+            indexs = vote_y * ww + vote_x
+            indexs = indexs.cpu().numpy()
+            counts = np.bincount(indexs, minlength=hh*ww)
+            counts = counts / (np.max(counts) + 1e-10)
+            counts = np.reshape(counts, (hh, ww))
+            counts = torch.from_numpy(counts).float().to(device)
+            vote_map[ii, 0, ...] = counts
+
+        return vote_map
+
+
+class Shell2Scale(torch.nn.Module):
+    def __init__(self, base_net, head_nets, *, reduced_stride=3):
+        super(Shell2Scale, self).__init__()
+
+        self.base_net = base_net
+        self.head_nets = torch.nn.ModuleList(head_nets)
+        self.reduced_stride = reduced_stride
+
+    @staticmethod
+    def merge_heads(original_h, reduced_h,
+                    logb_component_indices,
+                    stride):
+        mask = reduced_h[0] > original_h[0][:, :,
+                              :stride * reduced_h[0].shape[2]:stride,
+                              :stride * reduced_h[0].shape[3]:stride]
+        mask_vector = torch.stack((mask, mask), dim=2)
+
+        for ci, (original_c, reduced_c) in enumerate(zip(original_h, reduced_h)):
+            if ci == 0:
+                # confidence component
+                reduced_c = reduced_c * 0.5
+            elif ci in logb_component_indices:
+                # log(b) components
+                reduced_c = torch.log(torch.exp(reduced_c) * stride)
+            else:
+                # vectorial and scale components
+                reduced_c = reduced_c * stride
+
+            if len(original_c.shape) == 4:
+                original_c[:, :,
+                :stride * reduced_c.shape[2]:stride,
+                :stride * reduced_c.shape[3]:stride][mask] = reduced_c[mask]
+            elif len(original_c.shape) == 5:
+                original_c[:, :, :,
+                :stride * reduced_c.shape[3]:stride,
+                :stride * reduced_c.shape[4]:stride][mask_vector] = reduced_c[mask_vector]
+            else:
+                raise Exception('cannot process component with shape {}'
+                                ''.format(original_c.shape))
+
+    def forward(self, *args):
+        original_input = args[0]
+        original_x = self.base_net(original_input)
+        original_heads = [hn(original_x) for hn in self.head_nets]
+
+        reduced_input = original_input[:, :, ::self.reduced_stride, ::self.reduced_stride]
+        reduced_x = self.base_net(reduced_input)
+        reduced_heads = [hn(reduced_x) for hn in self.head_nets]
+
+        logb_component_indices = [(2,), (3, 4)]
+
+        for original_h, reduced_h, lci in zip(original_heads,
+                                              reduced_heads,
+                                              logb_component_indices):
+            self.merge_heads(original_h, reduced_h, lci, self.reduced_stride)
+
+        return original_heads
+
+
+class ShellMultiScale(torch.nn.Module):
+    def __init__(self, base_net, head_nets, *,
+                 process_heads=None, include_hflip=True):
+        super(ShellMultiScale, self).__init__()
+
+        self.base_net = base_net
+        self.head_nets = torch.nn.ModuleList(head_nets)
+        self.pif_hflip = heads.PifHFlip(
+            head_nets[0].meta.keypoints, datasets.constants.HFLIP)
+        self.paf_hflip = heads.PafHFlip(
+            head_nets[1].meta.keypoints, head_nets[1].meta.skeleton, datasets.constants.HFLIP)
+        self.paf_hflip_dense = heads.PafHFlip(
+            head_nets[2].meta.keypoints, head_nets[2].meta.skeleton, datasets.constants.HFLIP)
+        self.process_heads = process_heads
+        self.include_hflip = include_hflip
+
+    def forward(self, *args):
+        original_input = args[0]
+
+        head_outputs = []
+        for hflip in ([False, True] if self.include_hflip else [False]):
+            for reduction in [1, 1.5, 2, 3, 5]:
+                if reduction == 1.5:
+                    x_red = torch.ByteTensor(
+                        [i % 3 != 2 for i in range(original_input.shape[3])])
+                    y_red = torch.ByteTensor(
+                        [i % 3 != 2 for i in range(original_input.shape[2])])
+                    reduced_input = original_input[:, :, y_red, :]
+                    reduced_input = reduced_input[:, :, :, x_red]
+                else:
+                    reduced_input = original_input[:, :, ::reduction, ::reduction]
+
+                if hflip:
+                    reduced_input = torch.flip(reduced_input, dims=[3])
+
+                reduced_x = self.base_net(reduced_input)
+                head_outputs += [hn(reduced_x) for hn in self.head_nets]
+
+        if self.include_hflip:
+            for mscale_i in range(5, 10):
+                head_i = mscale_i * 3
+                head_outputs[head_i] = self.pif_hflip(*head_outputs[head_i])
+                head_outputs[head_i + 1] = self.paf_hflip(*head_outputs[head_i + 1])
+                head_outputs[head_i + 2] = self.paf_hflip_dense(*head_outputs[head_i + 2])
+
+        if self.process_heads is not None:
+            head_outputs = self.process_heads(*head_outputs)
+
+        return head_outputs
+
+
+# pylint: disable=too-many-branches
+def model_migration(net_cpu):
+    model_defaults(net_cpu)
+
+    if not hasattr(net_cpu, 'process_heads'):
+        net_cpu.process_heads = None
+
+
+def model_defaults(net_cpu):
+    for m in net_cpu.modules():
+        if isinstance(m, (torch.nn.BatchNorm1d, torch.nn.BatchNorm2d)):
+            # avoid numerical instabilities
+            # (only seen sometimes when training with GPU)
+            # Variances in pretrained models can be as low as 1e-17.
+            # m.running_var.clamp_(min=1e-8)
+            m.eps = 1e-4  # tf default is 0.001
+            # m.eps = 1e-5  # pytorch default
+
+            # less momentum for variance and expectation
+            m.momentum = 0.01  # tf default is 0.99
+            # m.momentum = 0.1  # pytorch default
