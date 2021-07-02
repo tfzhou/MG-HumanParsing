@@ -1,6 +1,6 @@
 #!/usr/bin/env sh
 
-CUDA_VISIBLE_DEVICES=4,5,6,7 python3 -m openpifpaf.train_v2 \
+CUDA_VISIBLE_DEVICES=4,5,6,7 python3 -m lib.train_v2 \
   --lr=7e-3 \
   --epochs=150 \
   --lr-decay 120 \
